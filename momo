@@ -1,0 +1,1592 @@
+#!/usr/bin/env python3
+"""
+momo - agent-native CLI for momo購物網 (www.momoshop.com.tw, TWD). No checkout.
+
+Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
+returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
+Exit codes: 0 ok, 1 api, 2 usage, 3 auth, 4 net/blocked.
+
+Endpoints, measured 2026-10-29 with real requests:
+--------------------------------------------------
+Search (HTML + Next.js App Router RSC, plain HTTPS, no login needed):
+  GET https://www.momoshop.com.tw/search/<keyword>?_isFuzzy=0&searchType=<sort>&curPage=<page>&priceS=<min>&priceE=<max>
+      searchType: 1 綜合推薦 (relevance, default), 2 價格由低至高 (price),
+                  3 價格由高至低 (price-desc), 6 月銷量 (sales), 5 新上市 (newest)
+      Embedded application/ld+json contains ItemList with 30 items per page:
+      name, offers.price, offers.availability (InStock), aggregateRating.ratingValue,
+      aggregateRating.reviewCount, description (promos), url with i_code.
+      RSC flight stream contains goodsCode, marketPriceModel.basePrice.price (original price).
+Product detail (HTML, plain HTTPS, no login needed):
+  GET https://www.momoshop.com.tw/goods/GoodsDetail.jsp?i_code=<id>
+      Embedded application/ld+json contains ProductGroup with:
+      name, brand.name, sku, description, hasVariant[] (sku/dtCode, name, offers.price,
+      shippingDetails, in_stock), additionalProperty[] (specs/attributes).
+Cart (JSON API on cart.momoshop.com.tw, requires session cookies + Authorization token):
+  POST https://cart.momoshop.com.tw/api/shoppingcart/query/getEachCartPICount
+       Payload: {"host": "WEB"}
+       Header: Authorization: Bearer <STORAGEINFO>, VERSION: <VERSION>
+       Returns resultCode: 1, custNo, and per-cart counts. Returns 403 when not logged in.
+  POST https://cart.momoshop.com.tw/api/shoppingcart/query/cartPageData
+       Payload: {"data":{"cartName":"newNormal","productStatus":[],"cartFlag":"2","moProGoodsCode":""},"host":"WEB"}
+       Returns resultCode: 1, rtnData.shopCart.tmGoods (all active items with goodsCode,
+       goodsName, goodsCount, goodsPrice, goodsdtCode, productKey, productKeys, productIds).
+       When cart is empty returns resultCode "CPV006" with totalCarts: 0.
+  POST https://cart.momoshop.com.tw/api/shoppingcart/modify/addGoods
+       Payload: {"host":"WEB","data":{"goShopCartYn":"1","goods":[{"work":"shopcart","goodsCode":...,
+       "goodsName":...,"goodsPrice":...,"goodsdtCode":"001","goodsCount":"1",...}]}}
+  POST https://cart.momoshop.com.tw/api/shoppingcart/modify/changeGoodsCount
+       Payload: {"host":"WEB","data":{"cartName":"newNormal","productId":...,"productIdList":[...],
+       "productKey":...,"productKeyList":[...],"goodsCode":...,"goodsCount":N}}
+  POST https://cart.momoshop.com.tw/api/shoppingcart/modify/removeGoods
+       Payload: {"host":"WEB","data":{"cartName":"newNormal","productKey":...,"productStatus":"0",
+       "productKeyList":[...]}}
+
+Login: never passwords/OTP. `momo login` (default --from-browser) reads the
+cookies of Edge on MOMO_CDP (default http://127.0.0.1:9222). If not signed in
+it opens momo's login page in a background tab and polls until you sign in there.
+It extracts STORAGEINFO and VERSION from the cart page and verifies the session
+with getEachCartPICount before saving to ~/.config/momo/state.json (0600) or
+keyring (--keyring). MOMO_COOKIE overrides both. Cart commands use the saved session.
+
+Transport: plain HTTPS first; on bot-block or captcha falls back to CDP background tab.
+--via auto|http|browser.
+
+No checkout / payment / order placement, by design.
+Unofficial. Undocumented, private API - it can break without warning.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import html as htmllib
+import json
+import os
+import re
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+CDP = os.environ.get("MOMO_CDP", "http://127.0.0.1:9222")
+ORIGIN = "https://www.momoshop.com.tw"
+CART_HOST = "https://cart.momoshop.com.tw"
+LOGIN_URL = ORIGIN + "/customer/login.jsp"
+CART_URL = CART_HOST + "/view/cart/WEB/newNormal"
+
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0")
+UA = os.environ.get("MOMO_UA", DEFAULT_UA)
+STATE_DIR = os.path.expanduser(os.environ.get("MOMO_HOME", "~/.config/momo"))
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+KEYRING_SERVICE = "momo-cli"
+
+SORTS = {
+    "relevance": 1,
+    "price": 2,
+    "price-desc": 3,
+    "sales": 6,
+    "bestselling": 6,
+    "newest": 5,
+    "new": 5,
+}
+
+
+class Net(Exception):
+    pass
+
+
+class Blocked(Net):
+    pass
+
+
+class Auth(Exception):
+    pass
+
+
+class ApiError(Exception):
+    def __init__(self, msg, detail=None):
+        super().__init__(msg)
+        self.detail = detail
+
+
+class Usage(ApiError):
+    pass
+
+
+# ---------------------------------------------------------------- envelope
+def ok(data):
+    return {"ok": True, "data": data}
+
+
+def err(msg, code=EX_ERR, **detail):
+    return {"ok": False, "error": {"message": msg, "code": code, "detail": detail or None}}
+
+
+def emit(payload, as_json, human=None):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get("ok"):
+        print(human() if callable(human) else
+              (human if human is not None else
+               json.dumps(payload["data"], ensure_ascii=False, indent=2)))
+    else:
+        print(payload["error"]["message"], file=sys.stderr)
+    return EX_OK if payload.get("ok") else payload["error"]["code"]
+
+
+def _w(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
+
+
+def table(rows, headers):
+    if not rows:
+        return "(no rows)"
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(_w(c) for c in col) for col in cols]
+    pad = lambda t, w: str(t) + " " * max(0, w - _w(t))  # noqa: E731
+    out = ["  ".join(pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    for r in rows:
+        out.append("  ".join(pad("" if c is None else c, w) for c, w in zip(r, widths)).rstrip())
+    return "\n".join(out)
+
+
+def clip(text, n):
+    text = (text or "").replace("\n", " ").strip()
+    if _w(text) <= n:
+        return text
+    out = ""
+    for c in text:
+        if _w(out + c) > n - 1:
+            break
+        out += c
+    return out + "…"
+
+
+def nt(v):
+    return "" if v is None else f"NT${v:,.0f}"
+
+
+def num(text):
+    m = re.search(r"-?[\d,]+(?:\.\d+)?", text or "")
+    return float(m.group(0).replace(",", "")) if m else None
+
+
+# -------------------------------------------------------- SSL Context
+def _ssl_context():
+    """Create SSL context with relaxed cert checking for systems where momo's chain lacks SKI."""
+    ctx = ssl.create_default_context()
+    try:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    except Exception:
+        pass
+    return ctx
+
+
+# -------------------------------------------------------- CDP (stdlib WS)
+class WS:
+    def __init__(self, url, timeout=60):
+        if not url.startswith("ws://"):
+            raise Net(f"unsupported websocket url {url}")
+        hostport, path = url[5:].split("/", 1)
+        host, port = hostport.rsplit(":", 1)
+        try:
+            self.s = socket.create_connection((host, int(port)), timeout=timeout)
+        except OSError as e:
+            raise Net(f"cannot reach browser at {hostport}: {e}")
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\n"
+                        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\n"
+                        "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.s.recv(4096)
+            if not chunk:
+                raise Net("websocket handshake closed")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0]:
+            raise Net("websocket handshake refused (start Edge with --remote-allow-origins='*')")
+        self.rest = buf.split(b"\r\n\r\n", 1)[1]
+        self.n = 0
+
+    def _recv(self, n):
+        while len(self.rest) < n:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise Net("browser closed the connection")
+            self.rest += chunk
+        out, self.rest = self.rest[:n], self.rest[n:]
+        return out
+
+    def _send(self, obj):
+        data = json.dumps(obj).encode()
+        hdr = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += struct.pack(">H", n)
+        else:
+            hdr.append(0x80 | 127)
+            hdr += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        hdr += mask
+        self.s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv_msg(self):
+        msg = b""
+        while True:
+            b0, b1 = self._recv(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._recv(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._recv(8))[0]
+            payload = self._recv(n)
+            op = b0 & 0x0F
+            if op == 8:
+                raise Net("browser closed the websocket")
+            if op in (9, 10):
+                continue
+            msg += payload
+            if b0 & 0x80:
+                return json.loads(msg)
+
+    def call(self, method, **params):
+        self.n += 1
+        i = self.n
+        self._send({"id": i, "method": method, "params": params})
+        while True:
+            m = self._recv_msg()
+            if m.get("id") == i:
+                if "error" in m:
+                    raise Net(f"{method}: {m['error'].get('message')}")
+                return m["result"]
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def _cdp_json(path):
+    try:
+        ctx = _ssl_context()
+        with urllib.request.urlopen(CDP + path, timeout=5, context=ctx) as r:
+            return json.loads(r.read())
+    except OSError as e:
+        raise Net(f"no browser on {CDP} ({e}). start Edge with --remote-debugging-port=9222")
+
+
+def _set_cdp(cdp):
+    global CDP
+    if cdp:
+        CDP = cdp
+
+
+def edge_cookies():
+    """All momo cookies of the CDP browser (browser-level, no tab needed)."""
+    ver = _cdp_json("/json/version")
+    b = WS(ver["webSocketDebuggerUrl"])
+    try:
+        cks = b.call("Storage.getCookies")["cookies"]
+    finally:
+        b.close()
+    keep = [{"name": c["name"], "value": c["value"], "domain": c["domain"], "path": c.get("path", "/")}
+            for c in cks if c["domain"].lstrip(".") == "momoshop.com.tw"
+            or c["domain"].endswith(".momoshop.com.tw")]
+    return keep, ver.get("User-Agent", DEFAULT_UA)
+
+
+class Browser:
+    """One background tab on momoshop.com.tw, closed on exit. Never focused; user tabs untouched."""
+
+    def __init__(self, url=ORIGIN + "/", debug=False, wait=True):
+        self.debug = debug
+        self.ver = _cdp_json("/json/version")
+        self.b = WS(self.ver["webSocketDebuggerUrl"])
+        self.tid = self.b.call("Target.createTarget", url=url, background=True)["targetId"]
+        try:
+            tgt = next(x for x in _cdp_json("/json/list") if x["id"] == self.tid)
+            self.p = WS(tgt["webSocketDebuggerUrl"], timeout=90)
+            if wait:
+                self.wait_ready(urllib.parse.urlparse(url).netloc)
+        except BaseException:
+            self.close()
+            raise
+
+    def wait_ready(self, host, limit=30):
+        t0 = time.time()
+        while time.time() - t0 < limit:
+            try:
+                r = self.eval("location.host + '|' + document.readyState + '|' + document.title")
+            except ApiError:
+                r = None
+            if r and r.startswith(host) and "|loading|" not in r and "Just a moment" not in r:
+                return
+            time.sleep(0.5)
+        raise Net(f"{host} did not load in the background tab")
+
+    def eval(self, expr):
+        r = self.p.call("Runtime.evaluate", expression=expr, awaitPromise=True, returnByValue=True)
+        if r.get("exceptionDetails"):
+            raise ApiError("page script failed: " + str(
+                r["exceptionDetails"].get("exception", {}).get("description")
+                or r["exceptionDetails"].get("text")))
+        return r.get("result", {}).get("value")
+
+    def fetch(self, method, url, body=None, headers=None):
+        opts = {"method": method, "credentials": "include", "headers": headers or {}}
+        if body is not None:
+            opts["body"] = body
+        js = ("fetch(%s,%s).then(async r=>({http:r.status,text:await r.text()}))"
+              % (json.dumps(url), json.dumps(opts)))
+        r = self.eval(js)
+        return r["http"], r["text"]
+
+    def close(self):
+        try:
+            self.b.call("Target.closeTarget", targetId=self.tid)
+        except Exception:
+            pass
+        for w in (getattr(self, "p", None), getattr(self, "b", None)):
+            if w:
+                w.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+# ------------------------------------------------------------------ state
+def _keyring(op, secret=None):
+    acct = "default"
+    try:
+        if sys.platform == "darwin":
+            cmd = {"set": ["security", "add-generic-password", "-U", "-a", acct,
+                           "-s", KEYRING_SERVICE, "-w", secret],
+                   "get": ["security", "find-generic-password", "-a", acct, "-s", KEYRING_SERVICE, "-w"],
+                   "del": ["security", "delete-generic-password", "-a", acct, "-s", KEYRING_SERVICE]}[op]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        else:
+            base = ["service", KEYRING_SERVICE, "account", acct]
+            cmd = {"set": ["secret-tool", "store", "--label=momo-cli"] + base,
+                   "get": ["secret-tool", "lookup"] + base,
+                   "del": ["secret-tool", "clear"] + base}[op]
+            r = subprocess.run(cmd, input=secret if op == "set" else None,
+                               capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Auth("no keyring tool (macOS `security` / Linux `secret-tool`)")
+    if op == "get":
+        return r.stdout.strip() if r.returncode == 0 else None
+    if op == "set" and r.returncode != 0:
+        raise Auth("keyring write failed: " + r.stderr.strip())
+    return True
+
+
+def clean_cookie(val):
+    if not val:
+        return ""
+    val = val.strip()
+    if val.lower().startswith("cookie:"):
+        val = val[7:].strip()
+    return val
+
+
+def cookie_list_to_header(cookies):
+    return "; ".join(f"{c['name']}={c['value']}" for c in cookies if c.get("name"))
+
+
+def cookie_header_to_list(header_str):
+    out = []
+    for part in (header_str or "").split(";"):
+        if "=" in part:
+            k, v = part.strip().split("=", 1)
+            out.append({"name": k.strip(), "value": v.strip(), "domain": ".momoshop.com.tw"})
+    return out
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        st = {}
+    except (OSError, ValueError) as e:
+        raise ApiError(f"state file unreadable: {e}")
+    if os.environ.get("MOMO_COOKIE"):
+        st["cookie"], st["source"] = clean_cookie(os.environ["MOMO_COOKIE"]), "env"
+        st["cookies"] = cookie_header_to_list(st["cookie"])
+    elif st.get("cookie_in_keyring"):
+        raw = _keyring("get")
+        if raw:
+            try:
+                data = json.loads(raw)
+                st.update(data)
+                st["source"] = "keyring"
+            except Exception:
+                st["cookie"], st["source"] = raw, "keyring"
+                st["cookies"] = cookie_header_to_list(raw)
+    elif st.get("cookie"):
+        st["source"] = "file"
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    out = {k: v for k, v in st.items() if k != "source"}
+    if out.get("cookie_in_keyring"):
+        blob = json.dumps(out, ensure_ascii=False)
+        _keyring("set", blob)
+        out = {"cookie_in_keyring": True, "saved_at": out.get("saved_at")}
+    tmp = STATE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def clear_state():
+    st = load_state()
+    if st.get("cookie_in_keyring"):
+        try:
+            _keyring("del")
+        except Exception:
+            pass
+    try:
+        os.remove(STATE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+# -------------------------------------------------------- HTTP Transport
+def _request(method, url, data=None, headers=None, cookies_str=None, timeout=15):
+    hdrs = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    if headers:
+        hdrs.update(headers)
+    if cookies_str:
+        hdrs["Cookie"] = cookies_str
+    body = None
+    if data is not None:
+        if isinstance(data, (dict, list)):
+            body = json.dumps(data).encode("utf-8")
+            if "Content-Type" not in hdrs:
+                hdrs["Content-Type"] = "application/json;charset=UTF-8"
+        elif isinstance(data, str):
+            body = data.encode("utf-8")
+        else:
+            body = data
+
+    req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+    ctx = _ssl_context()
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            content = resp.read()
+            return resp.status, resp.headers, content
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        return e.code, e.headers, body
+    except urllib.error.URLError as e:
+        raise Net(f"cannot connect to {url}: {e.reason}")
+    except OSError as e:
+        raise Net(f"network error on {url}: {e}")
+
+
+# -------------------------------------------------------- Search
+def search_momo(query, sort="relevance", page=1, limit=20, min_price=None, max_price=None, via="auto"):
+    sort_code = SORTS.get(sort, 1)
+    q_enc = urllib.parse.quote(query)
+    params = [f"_isFuzzy=0", f"searchType={sort_code}", f"curPage={page}"]
+    if min_price is not None:
+        params.append(f"priceS={int(min_price)}")
+    if max_price is not None:
+        params.append(f"priceE={int(max_price)}")
+    url = f"{ORIGIN}/search/{q_enc}?" + "&".join(params)
+
+    html = None
+    if via in ("auto", "http"):
+        try:
+            status, hdrs, content = _request("GET", url, headers={"Referer": ORIGIN + "/"})
+            if status == 200:
+                html = content.decode("utf-8", errors="replace")
+            elif status == 403:
+                if via == "http":
+                    raise Blocked(f"momo search returned 403 bot-wall")
+        except Net:
+            if via == "http":
+                raise
+
+    if html is None and via in ("auto", "browser"):
+        with Browser(url=url) as b:
+            time.sleep(2)
+            html = b.eval("document.documentElement.outerHTML")
+
+    if not html:
+        raise Net("failed to fetch momo search page")
+
+    # Extract ItemList from application/ld+json
+    items = []
+    scripts = re.findall(r'<script[^>]*type=[\'\"]application/ld\+json[\'\"][^>]*>(.*?)</script>', html, re.DOTALL)
+    for s in scripts:
+        try:
+            data = json.loads(s)
+            graph = data.get("@graph", [])
+            for node in graph:
+                if node.get("@type") == "ItemList":
+                    for it in node.get("itemListElement", []):
+                        purl = it.get("url", "")
+                        icode_m = re.search(r"i_code=(\d+)", purl)
+                        icode = icode_m.group(1) if icode_m else it.get("sku") or ""
+                        offers = it.get("offers", {})
+                        p_val = offers.get("price")
+                        p_flt = float(p_val) if p_val is not None else None
+                        rating_node = it.get("aggregateRating", {})
+                        items.append({
+                            "id": icode,
+                            "title": it.get("name", "").strip(),
+                            "price": p_flt,
+                            "orig_price": None,
+                            "discount": it.get("description", "").strip() or None,
+                            "rating": float(rating_node["ratingValue"]) if "ratingValue" in rating_node else None,
+                            "reviews": int(rating_node["reviewCount"]) if "reviewCount" in rating_node else None,
+                            "stock": offers.get("availability") == "https://schema.org/InStock",
+                            "url": f"{ORIGIN}/goods/GoodsDetail.jsp?i_code={icode}" if icode else purl,
+                        })
+        except Exception:
+            continue
+
+    # Extract original prices from RSC data if present
+    rsc_chunks = re.findall(r'\"goodsCode\":\"(\d+)\".*?\"marketPriceModel\":\{\"basePrice\":\{.*?\"price\":\"([^\"]+)\"', html)
+    orig_map = {}
+    for gcode, pstr in rsc_chunks:
+        try:
+            orig_map[gcode] = float(pstr.replace(",", ""))
+        except Exception:
+            pass
+    for it in items:
+        if it["id"] in orig_map:
+            it["orig_price"] = orig_map[it["id"]]
+
+    # Filter min/max price if specified (guarantee precision)
+    if min_price is not None:
+        items = [it for it in items if it["price"] is not None and it["price"] >= min_price]
+    if max_price is not None:
+        items = [it for it in items if it["price"] is not None and it["price"] <= max_price]
+
+    return items[:limit]
+
+
+# -------------------------------------------------------- Product Detail
+def product_id_from_arg(arg):
+    arg = arg.strip()
+    m = re.search(r"i_code=(\d+)", arg)
+    if m:
+        return m.group(1)
+    m = re.search(r"/product/(\d+)", arg)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"\d+", arg):
+        return arg
+    raise Usage(f"cannot extract momo product id from '{arg}' (expected digits or GoodsDetail.jsp?i_code=...)")
+
+
+def product_detail(arg, via="auto"):
+    pid = product_id_from_arg(arg)
+    url = f"{ORIGIN}/goods/GoodsDetail.jsp?i_code={pid}"
+
+    html = None
+    if via in ("auto", "http"):
+        try:
+            status, hdrs, content = _request("GET", url, headers={"Referer": ORIGIN + "/"})
+            if status == 200:
+                html = content.decode("utf-8", errors="replace")
+            elif status == 403 and via == "http":
+                raise Blocked(f"product page returned 403")
+        except Net:
+            if via == "http":
+                raise
+
+    if html is None and via in ("auto", "browser"):
+        with Browser(url=url) as b:
+            time.sleep(2)
+            html = b.eval("document.documentElement.outerHTML")
+
+    if not html:
+        raise Net(f"failed to fetch product {pid}")
+
+    scripts = re.findall(r'<script[^>]*type=[\'\"]application/ld\+json[\'\"][^>]*>(.*?)</script>', html, re.DOTALL)
+    prod_node = None
+    for s in scripts:
+        try:
+            data = json.loads(s)
+            for node in data.get("@graph", []):
+                if node.get("@type") in ("ProductGroup", "Product"):
+                    prod_node = node
+                    break
+        except Exception:
+            continue
+
+    if not prod_node:
+        raise ApiError(f"product {pid} not found or structured data missing")
+
+    brand = prod_node.get("brand", {}).get("name") if isinstance(prod_node.get("brand"), dict) else prod_node.get("brand")
+    title = prod_node.get("name", "").strip()
+    desc = prod_node.get("description", "").strip()
+
+    variants = []
+    shipping_label = None
+    raw_vars = prod_node.get("hasVariant", [])
+    if isinstance(raw_vars, list):
+        for v in raw_vars:
+            v_sku = str(v.get("sku") or "").strip()
+            v_name = v.get("name", "").strip()
+            v_offers = v.get("offers", {})
+            v_price = float(v_offers.get("price")) if v_offers.get("price") is not None else None
+            if not shipping_label and v_offers.get("shippingDetails"):
+                sd = v_offers["shippingDetails"][0]
+                shipping_label = sd.get("shippingLabel")
+            variants.append({
+                "id": v_sku,
+                "name": v_name,
+                "price": v_price,
+                "in_stock": v_offers.get("availability") == "https://schema.org/InStock" or "availability" not in v_offers,
+            })
+
+    main_price = variants[0]["price"] if variants else None
+    rating_node = prod_node.get("aggregateRating", {})
+
+    return {
+        "id": pid,
+        "title": title,
+        "brand": brand,
+        "price": main_price,
+        "orig_price": None,
+        "promo": desc or None,
+        "in_stock": any(v.get("in_stock", True) for v in variants) if variants else True,
+        "shipping": shipping_label or "momo宅配",
+        "rating": float(rating_node["ratingValue"]) if "ratingValue" in rating_node else None,
+        "reviews": int(rating_node["reviewCount"]) if "reviewCount" in rating_node else None,
+        "specs": variants,
+        "url": url,
+    }
+
+
+# -------------------------------------------------------- Cart APIs
+def _cart_headers(state):
+    cookies_str = state.get("cookie") or ""
+    storage = state.get("storage", {})
+    token = storage.get("STORAGEINFO") or ""
+    version = storage.get("VERSION") or ""
+    return {
+        "User-Agent": UA,
+        "Referer": CART_URL,
+        "Origin": CART_HOST,
+        "Content-Type": "application/json;charset=UTF-8",
+        "Authorization": f"Bearer {token}",
+        "VERSION": version,
+        "device": "4",
+        "pf": "1",
+    }, cookies_str
+
+
+def get_cart_counts(state):
+    headers, cookies_str = _cart_headers(state)
+    url = f"{CART_HOST}/api/shoppingcart/query/getEachCartPICount"
+    payload = {"host": "WEB"}
+    status, _, body = _request("POST", url, data=payload, headers=headers, cookies_str=cookies_str)
+    if status == 403:
+        raise Auth("cart session expired or unauthenticated (HTTP 403). Run `momo login`.")
+    try:
+        res = json.loads(body.decode("utf-8"))
+    except Exception as e:
+        raise ApiError(f"invalid JSON from cart count API: {e}")
+    if res.get("resultCode") != "1":
+        raise Auth(f"momo returned error {res.get('resultCode')}: {res.get('resultMessage')}")
+    return res
+
+
+def get_cart_data(state):
+    headers, cookies_str = _cart_headers(state)
+    url = f"{CART_HOST}/api/shoppingcart/query/cartPageData"
+    payload = {
+        "data": {
+            "cartName": "newNormal",
+            "productStatus": [],
+            "cartFlag": "2",
+            "moProGoodsCode": "",
+        },
+        "host": "WEB",
+    }
+    status, _, body = _request("POST", url, data=payload, headers=headers, cookies_str=cookies_str)
+    if status == 403:
+        raise Auth("cart session expired or unauthenticated (HTTP 403). Run `momo login`.")
+    try:
+        res = json.loads(body.decode("utf-8"))
+    except Exception as e:
+        raise ApiError(f"invalid JSON from cart data API: {e}")
+
+    # If cart is empty, momo returns resultCode "CPV006"
+    if res.get("resultCode") == "CPV006" or res.get("totalCarts") == 0:
+        return {"items": [], "total": 0, "subtotal": 0, "freight": 0, "discount": 0}
+
+    rtn = res.get("rtnData", {})
+    cart = rtn.get("shopCart", {})
+    tm_goods = cart.get("tmGoods", {})
+
+    items = []
+    line_no = 1
+    for k, v in tm_goods.items():
+        gcode = v.get("goodsCode")
+        count = v.get("goodsCount", 0)
+        # 1190537 is logistics fee item, skip from user items
+        if gcode in ("1190537",) or count <= 0:
+            continue
+        p_price = float(v.get("goodsPrice") or 0)
+        p_last = float(v.get("goodsLastAmt") or p_price)
+        unit_price = p_price / count if count > 0 else p_price
+        p_keys = v.get("productKeys") or ([v.get("productKey")] if v.get("productKey") else [])
+        p_ids = v.get("productIds") or ([v.get("productId")] if v.get("productId") else [])
+        items.append({
+            "line": line_no,
+            "id": gcode,
+            "name": v.get("goodsName"),
+            "spec": v.get("goodsdtShowInfo") or v.get("goodsdtName") or v.get("goodsdtCode") or "單一規格",
+            "dtCode": v.get("goodsdtCode") or "001",
+            "qty": int(count),
+            "unit_price": unit_price,
+            "subtotal": p_price,
+            "last_subtotal": p_last,
+            "productKey": v.get("productKey"),
+            "productKeys": p_keys,
+            "productId": v.get("productId"),
+            "productIds": p_ids,
+            "originCartName": v.get("originCartName") or "newNormal",
+        })
+        line_no += 1
+
+    subtotal = sum(it["subtotal"] for it in items)
+    freight = float(cart.get("freightLastAmt") or 0)
+    discount = float(cart.get("totalDcAmt") or 0)
+    total = float(cart.get("totalLastPrice") or (subtotal + freight - discount))
+
+    return {
+        "items": items,
+        "total": total,
+        "subtotal": subtotal,
+        "freight": freight,
+        "discount": discount,
+    }
+
+
+def cart_add(state, product_id, qty=1, spec=None):
+    pdetail = product_detail(product_id)
+    target_spec = None
+    specs = pdetail.get("specs") or []
+    if spec:
+        spec_s = spec.strip().lower()
+        for s in specs:
+            if spec_s in (s["name"].lower(), s["id"].lower()):
+                target_spec = s
+                break
+        if not target_spec:
+            avail = ", ".join(f"{s['id']}:{s['name']}" for s in specs)
+            raise Usage(f"spec '{spec}' not found for product {pdetail['id']} (available: {avail})")
+    elif len(specs) == 1:
+        target_spec = specs[0]
+    elif len(specs) > 1:
+        avail = ", ".join(f"{s['id']}:{s['name']}" for s in specs)
+        raise Usage(f"product {pdetail['id']} has multiple specs ({avail}) — pick one with --spec <id|name>")
+    else:
+        target_spec = {"id": "001", "name": "單一規格", "price": pdetail["price"]}
+
+    dt_code = target_spec.get("id") or "001"
+    unit_price = target_spec.get("price") or pdetail["price"] or 0
+
+    headers, cookies_str = _cart_headers(state)
+    headers["Referer"] = ORIGIN + "/"
+    url = f"{CART_HOST}/api/shoppingcart/modify/addGoods"
+    payload = {
+        "host": "WEB",
+        "data": {
+            "goShopCartYn": "1",
+            "goods": [{
+                "work": "shopcart",
+                "goodsCode": str(pdetail["id"]),
+                "goodsName": pdetail["title"],
+                "goodsPrice": str(int(unit_price)),
+                "goodsdtCode": dt_code,
+                "goodsCount": str(int(qty)),
+                "recoverYn": "0",
+                "addtionalGoods": [],
+                "setGoods": [],
+                "nsGift": [],
+                "applimitBuyYn": "0",
+                "applimitBuyfsCode": "",
+                "cn": "",
+                "defDely": "",
+                "limitBuy4MemberYn": "0",
+                "limitBuyQty": "30",
+                "negativeProfit": "",
+                "promoNo": "",
+                "savegetAmt": "",
+                "canUseBuy1Get1FreeYn": "0",
+                "largeMachineMounting": "0",
+                "largeMachineMountingPromoNo": "",
+            }],
+            "webCategoryCode": "",
+            "srcType": "00",
+            "cycleTimes": "",
+            "cycleFrequency": "",
+            "cycleYn": "0",
+            "oc": True,
+            "reduceQty": True,
+            "outPlanDate": "",
+            "webArea": "",
+            "webCid": "",
+            "webCtype": "",
+            "webOid": "",
+            "whCode": "",
+            "postalCode": "",
+            "inputAddress": "",
+            "receiverSeq": "",
+            "needInsurance": False,
+            "splitDeliveryFlag": False,
+        },
+    }
+
+    status, _, body = _request("POST", url, data=payload, headers=headers, cookies_str=cookies_str)
+    if status == 403:
+        raise Auth("cart session expired. Run `momo login`.")
+    try:
+        res = json.loads(body.decode("utf-8"))
+    except Exception as e:
+        raise ApiError(f"invalid JSON from addGoods API: {e}")
+    if res.get("resultCode") != "1":
+        raise ApiError(f"failed to add product to cart: {res.get('resultMessage')}")
+
+    # Re-read cart to confirm
+    cdata = get_cart_data(state)
+    matching = [it for it in cdata["items"] if it["id"] == str(pdetail["id"])]
+    if not matching:
+        raise ApiError("addGoods succeeded but item was not found in cart after verification")
+
+    return {
+        "added": {
+            "id": pdetail["id"],
+            "title": pdetail["title"],
+            "spec": target_spec["name"],
+            "dtCode": dt_code,
+            "qty": qty,
+            "price": unit_price,
+        },
+        "cart": cdata,
+    }
+
+
+def cart_rm(state, line_or_id):
+    cdata = get_cart_data(state)
+    target = None
+    if str(line_or_id).isdigit():
+        ln = int(line_or_id)
+        for it in cdata["items"]:
+            if it["line"] == ln:
+                target = it
+                break
+    if not target:
+        for it in cdata["items"]:
+            if it["id"] == str(line_or_id):
+                target = it
+                break
+    if not target:
+        raise Usage(f"item '{line_or_id}' not found in cart (run `momo cart list`)")
+
+    headers, cookies_str = _cart_headers(state)
+    url = f"{CART_HOST}/api/shoppingcart/modify/removeGoods"
+    payload = {
+        "host": "WEB",
+        "data": {
+            "cartName": "newNormal",
+            "productKey": target["productKey"],
+            "productStatus": "0",
+            "productKeyList": target["productKeys"],
+        },
+    }
+
+    status, _, body = _request("POST", url, data=payload, headers=headers, cookies_str=cookies_str)
+    if status == 403:
+        raise Auth("cart session expired. Run `momo login`.")
+    try:
+        res = json.loads(body.decode("utf-8"))
+    except Exception as e:
+        raise ApiError(f"invalid JSON from removeGoods API: {e}")
+    if res.get("resultCode") != "1":
+        raise ApiError(f"failed to remove goods: {res.get('resultMessage')}")
+
+    # Re-read cart to confirm
+    cdata_new = get_cart_data(state)
+    still_there = any(it["id"] == target["id"] for it in cdata_new["items"])
+    if still_there:
+        raise ApiError(f"removeGoods succeeded but product {target['id']} is still in cart")
+
+    return {
+        "removed": target,
+        "cart": cdata_new,
+    }
+
+
+def cart_qty(state, line_or_id, qty):
+    cdata = get_cart_data(state)
+    target = None
+    if str(line_or_id).isdigit():
+        ln = int(line_or_id)
+        for it in cdata["items"]:
+            if it["line"] == ln:
+                target = it
+                break
+    if not target:
+        for it in cdata["items"]:
+            if it["id"] == str(line_or_id):
+                target = it
+                break
+    if not target:
+        raise Usage(f"item '{line_or_id}' not found in cart (run `momo cart list`)")
+
+    if target["qty"] == qty:
+        return {"updated": target, "cart": cdata, "message": "quantity already matches"}
+
+    headers, cookies_str = _cart_headers(state)
+    url = f"{CART_HOST}/api/shoppingcart/modify/changeGoodsCount"
+    payload = {
+        "host": "WEB",
+        "data": {
+            "cartName": "newNormal",
+            "productId": target["productId"],
+            "productIdList": target["productIds"],
+            "productKey": target["productKey"],
+            "productKeyList": target["productKeys"],
+            "goodsCode": target["id"],
+            "goodsCount": int(qty),
+        },
+    }
+
+    status, _, body = _request("POST", url, data=payload, headers=headers, cookies_str=cookies_str)
+    if status == 403:
+        raise Auth("cart session expired. Run `momo login`.")
+    try:
+        res = json.loads(body.decode("utf-8"))
+    except Exception as e:
+        raise ApiError(f"invalid JSON from changeGoodsCount API: {e}")
+    if res.get("resultCode") != "1":
+        raise ApiError(f"failed to change quantity: {res.get('resultMessage')}")
+
+    # Re-read cart to confirm
+    cdata_new = get_cart_data(state)
+    matching = [it for it in cdata_new["items"] if it["id"] == target["id"]]
+    if not matching or matching[0]["qty"] != int(qty):
+        actual = matching[0]["qty"] if matching else 0
+        raise ApiError(f"changeGoodsCount succeeded but quantity is {actual}, expected {qty}")
+
+    return {
+        "updated": matching[0],
+        "cart": cdata_new,
+    }
+
+
+# -------------------------------------------------------- Login & Whoami
+def login_from_browser(wait_seconds=300, keyring=False):
+    cks, ua = edge_cookies()
+    cookie_dict = {c["name"]: c["value"] for c in cks}
+
+    # Check if signed in
+    is_signed_in = (
+        cookie_dict.get("loginRsult") == "1"
+        or cookie_dict.get("customer") == "1"
+        or "loginUser" in cookie_dict
+    )
+
+    tid = None
+    if not is_signed_in:
+        print(f"Edge is not logged into momo. Opening background tab to login page...", file=sys.stderr)
+        ver = _cdp_json("/json/version")
+        b_ws = WS(ver["webSocketDebuggerUrl"])
+        try:
+            target = b_ws.call("Target.createTarget", url=LOGIN_URL, background=True)
+            tid = target["targetId"]
+            print(f"Please sign in to momo in Edge. Waiting up to {wait_seconds}s...", file=sys.stderr)
+            t0 = time.time()
+            while time.time() - t0 < wait_seconds:
+                time.sleep(3)
+                cks, _ = edge_cookies()
+                cd = {c["name"]: c["value"] for c in cks}
+                if cd.get("loginRsult") == "1" or cd.get("customer") == "1" or "loginUser" in cd:
+                    is_signed_in = True
+                    break
+        finally:
+            if tid:
+                try:
+                    b_ws.call("Target.closeTarget", targetId=tid)
+                except Exception:
+                    pass
+            b_ws.close()
+
+    if not is_signed_in:
+        raise Auth(f"not logged into momo in Edge after waiting {wait_seconds}s")
+
+    # Fetch STORAGEINFO and VERSION from cart page
+    storage = {}
+    ver = _cdp_json("/json/version")
+    b_ws = WS(ver["webSocketDebuggerUrl"])
+    bg_tid = None
+    try:
+        # Check if an existing tab already has cart
+        tabs = _cdp_json("/json/list")
+        cart_tabs = [t for t in tabs if "cart.momoshop.com.tw" in t.get("url", "")]
+        tab_ws = None
+        if cart_tabs:
+            tab_ws = WS(cart_tabs[0]["webSocketDebuggerUrl"])
+        else:
+            bg_target = b_ws.call("Target.createTarget", url=CART_URL, background=True)
+            bg_tid = bg_target["targetId"]
+            tabs = _cdp_json("/json/list")
+            tgt = next(t for t in tabs if t["id"] == bg_tid)
+            tab_ws = WS(tgt["webSocketDebuggerUrl"])
+            time.sleep(2)
+
+        for _ in range(25):
+            res = tab_ws.call("Runtime.evaluate", expression="""
+            ({
+                STORAGEINFO: localStorage.getItem('STORAGEINFO'),
+                VERSION: localStorage.getItem('VERSION')
+            })
+            """, returnByValue=True)
+            val = res.get("result", {}).get("value", {})
+            if val.get("STORAGEINFO") and val.get("VERSION"):
+                storage = val
+                break
+            time.sleep(0.5)
+        tab_ws.close()
+    finally:
+        if bg_tid:
+            try:
+                b_ws.call("Target.closeTarget", targetId=bg_tid)
+            except Exception:
+                pass
+        b_ws.close()
+
+    cookie_hdr = cookie_list_to_header(cks)
+    st = {
+        "cookies": cks,
+        "cookie": cookie_hdr,
+        "storage": storage,
+        "cookie_in_keyring": keyring,
+        "saved_at": int(time.time()),
+    }
+
+    # Verify session via plain HTTP
+    vres = get_cart_counts(st)
+    cust_no = vres.get("custNo") or cookie_dict.get("cn") or ""
+    masked_name = urllib.parse.unquote(cookie_dict.get("loginUser", "")).strip()
+
+    # Base64 decode ck_mlu for member ID
+    ck_mlu = cookie_dict.get("ck_mlu", "")
+    member_id = ""
+    if ck_mlu:
+        try:
+            member_id = base64.b64decode(ck_mlu.strip('"')).decode("utf-8", errors="replace")
+        except Exception:
+            member_id = ck_mlu
+
+    st["user"] = {
+        "custNo": cust_no,
+        "memberId": member_id,
+        "loginUser": masked_name,
+        "couponNumber": cookie_dict.get("couponNumber", "0"),
+        "wishlistNumber": cookie_dict.get("WishListNumber", "0"),
+    }
+
+    save_state(st)
+    return st
+
+
+def login_from_cookie(cookie_str, keyring=False):
+    cleaned = clean_cookie(cookie_str)
+    cks = cookie_header_to_list(cleaned)
+    st = {
+        "cookies": cks,
+        "cookie": cleaned,
+        "storage": {},
+        "cookie_in_keyring": keyring,
+        "saved_at": int(time.time()),
+    }
+    cd = {c["name"]: c["value"] for c in cks}
+    cust_no = cd.get("cn", "")
+    masked_name = urllib.parse.unquote(cd.get("loginUser", "")).strip()
+    ck_mlu = cd.get("ck_mlu", "")
+    member_id = ""
+    if ck_mlu:
+        try:
+            member_id = base64.b64decode(ck_mlu.strip('"')).decode("utf-8", errors="replace")
+        except Exception:
+            member_id = ck_mlu
+
+    st["user"] = {
+        "custNo": cust_no,
+        "memberId": member_id,
+        "loginUser": masked_name,
+        "couponNumber": cd.get("couponNumber", "0"),
+        "wishlistNumber": cd.get("WishListNumber", "0"),
+    }
+    save_state(st)
+    return st
+
+
+def whoami_data(state):
+    if not state.get("cookie"):
+        raise Auth("not logged in. Run `momo login`.")
+    counts = get_cart_counts(state)
+    u = state.get("user") or {}
+    total_cart_items = 0
+    for c in counts.get("rtnData", {}).get("rtnData", []):
+        total_cart_items += c.get("totalCount", 0)
+
+    return {
+        "custNo": counts.get("custNo") or u.get("custNo"),
+        "memberId": u.get("memberId"),
+        "loginUser": u.get("loginUser"),
+        "coupons": u.get("couponNumber"),
+        "wishlist": u.get("wishlistNumber"),
+        "cartItems": total_cart_items,
+        "sessionSource": state.get("source", "file"),
+    }
+
+
+# -------------------------------------------------------- Doctor
+def run_doctor():
+    report = {"http": False, "browser": False, "login": False, "cart": False, "details": {}}
+    # 1. HTTP transport
+    try:
+        st, _, body = _request("GET", ORIGIN + "/")
+        report["http"] = st == 200
+        report["details"]["http_status"] = st
+    except Exception as e:
+        report["details"]["http_error"] = str(e)
+
+    # 2. Browser CDP
+    try:
+        v = _cdp_json("/json/version")
+        report["browser"] = True
+        report["details"]["browser"] = v.get("Browser")
+    except Exception as e:
+        report["details"]["browser_error"] = str(e)
+
+    # 3. Login & Cart
+    st = load_state()
+    if st.get("cookie"):
+        try:
+            who = whoami_data(st)
+            report["login"] = True
+            report["cart"] = True
+            report["details"]["user"] = who
+        except Exception as e:
+            report["details"]["auth_error"] = str(e)
+
+    return report
+
+
+# -------------------------------------------------------- Command Handlers
+def cmd_doctor(args):
+    doc = run_doctor()
+    def h():
+        lines = [
+            f"HTTP transport:   {'OK' if doc['http'] else 'FAIL'}",
+            f"Browser (CDP):    {'OK (' + str(doc['details'].get('browser')) + ')' if doc['browser'] else 'FAIL'}",
+            f"Login state:      {'SIGNED IN' if doc['login'] else 'NOT LOGGED IN'}",
+            f"Cart reachability:{'OK' if doc['cart'] else 'NO SESSION'}",
+        ]
+        if doc["details"].get("user"):
+            u = doc["details"]["user"]
+            lines.append(f"Member:           {u.get('loginUser')} (custNo: {u.get('custNo')}, memberId: {u.get('memberId')})")
+        return "\n".join(lines)
+    return emit(ok(doc), args.json, h)
+
+
+def cmd_search(args):
+    results = search_momo(
+        args.query,
+        sort=args.sort,
+        page=args.page,
+        limit=args.limit,
+        min_price=args.min_price,
+        max_price=args.max_price,
+        via=args.via,
+    )
+    def h():
+        rows = []
+        for it in results:
+            rows.append([
+                it["id"],
+                clip(it["title"], 40),
+                nt(it["price"]),
+                nt(it["orig_price"]),
+                clip(it["discount"] or "", 14),
+                f"{it['rating']:.1f}" if it["rating"] else "",
+                str(it["reviews"]) if it["reviews"] else "",
+                "Y" if it["stock"] else "N",
+            ])
+        return table(rows, ["ID", "Title", "Price", "Orig", "Discount", "Rate", "Rev", "Stk"])
+    return emit(ok(results), args.json, h)
+
+
+def cmd_product(args):
+    prod = product_detail(args.product, via=args.via)
+    def h():
+        lines = [
+            f"ID:       {prod['id']}",
+            f"Title:    {prod['title']}",
+            f"Brand:    {prod['brand'] or '(none)'}",
+            f"Price:    {nt(prod['price'])}",
+            f"Stock:    {'In Stock' if prod['in_stock'] else 'Out of Stock'}",
+            f"Shipping: {prod['shipping']}",
+            f"Rating:   {prod['rating']} ({prod['reviews']} reviews)" if prod["rating"] else "Rating:   (none)",
+            f"Promo:    {prod['promo'] or '(none)'}",
+            f"URL:      {prod['url']}",
+        ]
+        if prod.get("specs"):
+            lines.append("\nSpecs / Variants:")
+            s_rows = [[s["id"], s["name"], nt(s["price"]), "Y" if s["in_stock"] else "N"] for s in prod["specs"]]
+            lines.append(table(s_rows, ["SKU", "Variant Name", "Price", "Stock"]))
+        return "\n".join(lines)
+    return emit(ok(prod), args.json, h)
+
+
+def cmd_price(args):
+    out = []
+    for item in args.products:
+        try:
+            pd = product_detail(item, via=args.via)
+            out.append({
+                "id": pd["id"],
+                "title": pd["title"],
+                "price": pd["price"],
+                "in_stock": pd["in_stock"],
+                "url": pd["url"],
+            })
+        except Exception as e:
+            out.append({"id": str(item), "error": str(e), "price": None})
+    def h():
+        rows = [[it["id"], clip(it.get("title", ""), 45), nt(it.get("price")), "Y" if it.get("in_stock") else "N"] for it in out]
+        return table(rows, ["ID", "Title", "Price", "Stk"])
+    return emit(ok(out), args.json, h)
+
+
+def cmd_raw(args):
+    path = args.path
+    url = path if path.startswith("http") else f"{ORIGIN}/{path.lstrip('/')}"
+    st = load_state()
+    headers, cstr = _cart_headers(st) if st.get("cookie") else ({}, None)
+    code, _, content = _request("GET", url, headers=headers, cookies_str=cstr)
+    try:
+        data = json.loads(content.decode("utf-8"))
+    except Exception:
+        data = content.decode("utf-8", errors="replace")
+    return emit(ok({"status": code, "response": data}), args.json)
+
+
+def cmd_login(args):
+    if args.cookie_stdin:
+        cookie_str = sys.stdin.read()
+        st = login_from_cookie(cookie_str, keyring=args.keyring)
+    elif args.from_clipboard:
+        cmd = ["pbpaste"] if sys.platform == "darwin" else ["wl-paste"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            cookie_str = res.stdout
+        except Exception:
+            try:
+                res = subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True, text=True, check=True)
+                cookie_str = res.stdout
+            except Exception:
+                raise Usage("could not read clipboard (install wl-paste or xclip)")
+        st = login_from_cookie(cookie_str, keyring=args.keyring)
+    else:
+        st = login_from_browser(wait_seconds=args.wait, keyring=args.keyring)
+
+    who = whoami_data(st)
+    def h():
+        return f"Logged in successfully as {who['loginUser']} (custNo: {who['custNo']}, memberId: {who['memberId']})"
+    return emit(ok(who), args.json, h)
+
+
+def cmd_whoami(args):
+    st = load_state()
+    who = whoami_data(st)
+    def h():
+        return "\n".join([
+            f"Member Name:  {who['loginUser']}",
+            f"Member ID:    {who['memberId']}",
+            f"Cust No:      {who['custNo']}",
+            f"Coupons:      {who['coupons']}",
+            f"Wishlist:     {who['wishlist']}",
+            f"Cart Items:   {who['cartItems']}",
+            f"Source:       {who['sessionSource']}",
+        ])
+    return emit(ok(who), args.json, h)
+
+
+def cmd_logout(args):
+    clear_state()
+    return emit(ok({"message": "Logged out successfully"}), args.json, "Logged out successfully.")
+
+
+def cmd_cart(args):
+    st = load_state()
+    if not st.get("cookie"):
+        raise Auth("cart commands require login. Run `momo login`.")
+
+    action = args.action
+    if not action or action == "list":
+        cdata = get_cart_data(st)
+        def h():
+            items = cdata["items"]
+            if not items:
+                return "Your momo shopping cart is empty."
+            rows = []
+            for it in items:
+                rows.append([
+                    str(it["line"]),
+                    it["id"],
+                    clip(it["name"], 38),
+                    clip(it["spec"], 12),
+                    str(it["qty"]),
+                    nt(it["unit_price"]),
+                    nt(it["subtotal"]),
+                ])
+            tbl = table(rows, ["Line", "ID", "Name", "Spec", "Qty", "Price", "Subtotal"])
+            summary = [
+                f"\nTotal Items:  {len(items)}",
+                f"Subtotal:     {nt(cdata['subtotal'])}",
+                f"Shipping:     {nt(cdata['freight'])}",
+                f"Discount:    -{nt(cdata['discount'])}",
+                f"Total:        {nt(cdata['total'])}",
+            ]
+            return tbl + "\n" + "\n".join(summary)
+        return emit(ok(cdata), args.json, h)
+
+    elif action == "add":
+        if not args.ref:
+            raise Usage("cart add needs a product id or URL")
+        if not args.yes:
+            pd = product_detail(args.ref, via=args.via)
+            specs = pd.get("specs") or []
+            chosen_spec = None
+            if args.spec:
+                for s in specs:
+                    if args.spec.strip().lower() in (s["name"].lower(), s["id"].lower()):
+                        chosen_spec = s
+                        break
+            elif len(specs) == 1:
+                chosen_spec = specs[0]
+            dry = {
+                "dry_run": True,
+                "action": "add",
+                "id": pd["id"],
+                "title": pd["title"],
+                "spec": chosen_spec["name"] if chosen_spec else (args.spec or "default"),
+                "qty": args.qty,
+                "price": chosen_spec["price"] if chosen_spec else pd["price"],
+                "subtotal": (chosen_spec["price"] if chosen_spec else pd["price"] or 0) * args.qty,
+            }
+            def h():
+                return (f"DRY RUN (pass --yes to execute):\n"
+                        f"Would add {dry['qty']}x '{dry['title']}' ({dry['spec']}) at {nt(dry['price'])} each.")
+            return emit(ok(dry), args.json, h)
+
+        res = cart_add(st, args.ref, qty=args.qty, spec=args.spec)
+        def h():
+            it = res["added"]
+            return f"Added to cart: {it['qty']}x '{it['title']}' ({it['spec']}) - {nt(it['price'])} each."
+        return emit(ok(res), args.json, h)
+
+    elif action == "rm":
+        if not args.ref:
+            raise Usage("cart rm needs a line # or product id")
+        if not args.yes:
+            cdata = get_cart_data(st)
+            target = None
+            if str(args.ref).isdigit() and len(args.ref) < 4:
+                ln = int(args.ref)
+                for it in cdata["items"]:
+                    if it["line"] == ln: target = it; break
+            if not target:
+                for it in cdata["items"]:
+                    if it["id"] == str(args.ref): target = it; break
+            dry = {
+                "dry_run": True,
+                "action": "remove",
+                "target": target or {"query": args.ref},
+            }
+            def h():
+                if target:
+                    return f"DRY RUN (pass --yes to execute):\nWould remove '{target['name']}' (Line {target['line']}, ID {target['id']}) from cart."
+                return f"DRY RUN: item '{args.ref}' not found in cart."
+            return emit(ok(dry), args.json, h)
+
+        res = cart_rm(st, args.ref)
+        def h():
+            r = res["removed"]
+            return f"Removed from cart: '{r['name']}' (Line {r['line']}, ID {r['id']})."
+        return emit(ok(res), args.json, h)
+
+    elif action == "qty":
+        if not args.ref:
+            raise Usage("cart qty needs a line # or product id")
+        new_qty = args.n if args.n is not None else args.qty
+        if not args.yes:
+            cdata = get_cart_data(st)
+            target = None
+            if str(args.ref).isdigit() and len(args.ref) < 4:
+                ln = int(args.ref)
+                for it in cdata["items"]:
+                    if it["line"] == ln: target = it; break
+            if not target:
+                for it in cdata["items"]:
+                    if it["id"] == str(args.ref): target = it; break
+            dry = {
+                "dry_run": True,
+                "action": "qty",
+                "target": target or {"query": args.ref},
+                "new_qty": new_qty,
+            }
+            def h():
+                if target:
+                    return f"DRY RUN (pass --yes to execute):\nWould set qty of '{target['name']}' from {target['qty']} to {new_qty}."
+                return f"DRY RUN: item '{args.ref}' not found in cart."
+            return emit(ok(dry), args.json, h)
+
+        res = cart_qty(st, args.ref, new_qty)
+        def h():
+            u = res["updated"]
+            return f"Updated qty: '{u['name']}' is now {u['qty']}x."
+        return emit(ok(res), args.json, h)
+
+    raise Usage(f"unknown cart action '{action}'")
+
+
+# -------------------------------------------------------- Parser
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        as_json = "--json" in sys.argv
+        emit(err(f"{self.prog}: {message}", EX_USAGE), as_json)
+        if not as_json:
+            self.print_usage(sys.stderr)
+        sys.exit(EX_USAGE)
+
+
+def build_parser():
+    p = Parser(prog="momo", description="momo購物網 from the shell (no checkout).")
+    p.add_argument("--version", action="version", version=f"momo {VERSION}")
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="output JSON envelope {ok, data|error}")
+    common.add_argument("--via", choices=["auto", "http", "browser"], default="auto",
+                        help="transport: auto, http, browser (default: auto)")
+    common.add_argument("--cdp", default=None, help=f"CDP browser URL (default: {CDP})")
+
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+
+    sub.add_parser("doctor", parents=[common], help="API reachability, browser, login + cart state"
+                   ).set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("search", parents=[common], help="search products")
+    s.add_argument("query", help="search keyword")
+    s.add_argument("--limit", type=int, default=20, help="max results (default: 20)")
+    s.add_argument("--sort", choices=list(SORTS.keys()), default="relevance",
+                   help="sort order (default: relevance)")
+    s.add_argument("--page", type=int, default=1, help="page number (default: 1)")
+    s.add_argument("--min", type=float, dest="min_price", help="minimum price TWD")
+    s.add_argument("--max", type=float, dest="max_price", help="maximum price TWD")
+    s.set_defaults(fn=cmd_search)
+
+    pr = sub.add_parser("product", aliases=["item"], parents=[common],
+                        help="product details with specs/variants")
+    pr.add_argument("product", help="product id or GoodsDetail.jsp URL")
+    pr.set_defaults(fn=cmd_product)
+
+    pc = sub.add_parser("price", parents=[common], help="quick batch price check")
+    pc.add_argument("products", nargs="+", help="one or more product ids or URLs")
+    pc.set_defaults(fn=cmd_price)
+
+    r = sub.add_parser("raw", parents=[common], help="GET a read-only momo JSON endpoint")
+    r.add_argument("path", help="path or full URL")
+    r.set_defaults(fn=cmd_raw)
+
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in momo session")
+    g = lg.add_mutually_exclusive_group()
+    g.add_argument("--from-browser", action="store_true", default=True,
+                   help="(default) copy session from Edge CDP")
+    g.add_argument("--from-clipboard", action="store_true", help="Cookie header from clipboard")
+    g.add_argument("--cookie-stdin", action="store_true", help="paste/pipe Cookie header")
+    lg.add_argument("--wait", type=int, default=300, help="seconds to wait for login (default: 300)")
+    lg.add_argument("--keyring", action="store_true", help="store session in OS keyring")
+    lg.set_defaults(fn=cmd_login)
+
+    sub.add_parser("whoami", parents=[common], help="verify and show member account status"
+                   ).set_defaults(fn=cmd_whoami)
+    sub.add_parser("logout", parents=[common], help="forget saved session"
+                   ).set_defaults(fn=cmd_logout)
+
+    ct = sub.add_parser("cart", parents=[common], help="購物車: list / add / rm / qty (no checkout)")
+    ct.add_argument("action", nargs="?", default="list", choices=["list", "add", "rm", "qty"])
+    ct.add_argument("ref", nargs="?", help="add: product id/URL; rm/qty: line # or product id")
+    ct.add_argument("n", nargs="?", type=int, help="qty: new quantity")
+    ct.add_argument("--qty", type=int, default=1, help="quantity (default 1)")
+    ct.add_argument("--spec", "--opt", dest="spec", help="variant name or sku id")
+    ct.add_argument("--yes", action="store_true", help="really execute write (else dry run)")
+    ct.set_defaults(fn=cmd_cart)
+
+    return p
+
+
+def main(argv=None):
+    p = build_parser()
+    args = p.parse_args(argv)
+    if getattr(args, "cdp", None):
+        _set_cdp(args.cdp)
+
+    try:
+        return args.fn(args)
+    except Auth as e:
+        return emit(err(str(e), EX_AUTH), args.json)
+    except Net as e:
+        return emit(err(str(e), EX_NET), args.json)
+    except Usage as e:
+        return emit(err(str(e), EX_USAGE, **(e.detail or {})), args.json)
+    except ApiError as e:
+        return emit(err(str(e), EX_ERR, **(e.detail or {})), args.json)
+    except BrokenPipeError:
+        return EX_OK
+    except KeyboardInterrupt:
+        return EX_ERR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
