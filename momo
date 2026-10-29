@@ -24,6 +24,13 @@ Search (HTML + Next.js App Router RSC, plain HTTPS, no login needed):
       So for --sort price/price-desc the CLI instead collects candidates from
       relevance pages (measured ad-free), drops listings with no real i_code/sku,
       dedupes, and sorts+paginates client-side. See search_momo() / _parse_search_items().
+      CAVEAT 2 (measured 2026-10-30): the pinned/sponsored block can repeat a second
+      time later within the *same* page's own ItemList (not just at the top), and it
+      leaks across pages too (a page-2 request can replay a page-1 pinned item).
+      search_momo() now dedupes by product id across the backend pages it fetches for
+      every sort (not just price), backfilling more backend pages until --limit unique
+      ids are collected, so a page is always internally unique and never repeats the
+      previous page.
 Product detail (HTML, plain HTTPS, no login needed):
   GET https://www.momoshop.com.tw/goods/GoodsDetail.jsp?i_code=<id>
       Embedded application/ld+json contains ProductGroup with:
@@ -644,34 +651,54 @@ def _apply_price_bounds(items, min_price, max_price):
 
 
 def search_momo(query, sort="relevance", page=1, limit=20, min_price=None, max_price=None, via="auto"):
-    if sort in ("price", "price-desc"):
-        # Source clean candidates from relevance pages (momo's own price
-        # sort is ad-polluted, see note above), then sort client-side.
-        needed = page * limit
-        collected = {}
-        backend_page = 1
-        empty_streak = 0
-        while len(collected) < needed and backend_page <= AD_FETCH_PAGE_CAP and empty_streak < 2:
-            page_items = _fetch_one_search_page(query, SORTS["relevance"], backend_page, via=via)
-            if not page_items:
-                empty_streak += 1
-            else:
-                empty_streak = 0
-                for it in page_items:
-                    if it["id"] not in collected and it["price"] is not None:
-                        collected[it["id"]] = it
-            backend_page += 1
+    # Every sort shares the same pool-building shape: fetch backend pages
+    # sequentially starting at 1, dedupe by product id (keep the first
+    # occurrence), and accumulate until there are enough unique candidates
+    # to cover the requested client-side page. This is required because
+    # momo's own ItemList repeats its pinned/sponsored block -- not just at
+    # the top of every page (so it leaks across pages: a page-2 request can
+    # literally replay page-1's pinned items), but sometimes a second time
+    # later within the *same* page's organic listing too (measured
+    # 2026-10-30: positions 0 and 6 can be the same i_code on one page).
+    # Without this dedupe, page 1 itself can contain the same product
+    # twice, and page 2 can repeat a page-1 product.
+    #
+    # For --sort price/price-desc we additionally source candidates from
+    # relevance pages (momo's own price sort is ad-polluted, see note
+    # above) and sort the deduped pool client-side; relevance/sales/newest
+    # keep momo's own backend order, just deduped.
+    use_price_sort = sort in ("price", "price-desc")
+    fetch_sort_code = SORTS["relevance"] if use_price_sort else SORTS.get(sort, 1)
 
-        pool = _apply_price_bounds(list(collected.values()), min_price, max_price)
+    needed = page * limit
+    collected = {}
+    backend_page = 1
+    empty_streak = 0
+    while len(collected) < needed and backend_page <= AD_FETCH_PAGE_CAP and empty_streak < 2:
+        if use_price_sort:
+            page_items = _fetch_one_search_page(query, fetch_sort_code, backend_page, via=via)
+        else:
+            page_items = _fetch_one_search_page(query, fetch_sort_code, backend_page, via=via,
+                                                 min_price=min_price, max_price=max_price)
+        if not page_items:
+            empty_streak += 1
+        else:
+            empty_streak = 0
+            for it in page_items:
+                if it["id"] in collected:
+                    continue
+                if use_price_sort and it["price"] is None:
+                    continue
+                collected[it["id"]] = it
+        backend_page += 1
+
+    pool = _apply_price_bounds(list(collected.values()), min_price, max_price)
+    if use_price_sort:
         reverse = sort == "price-desc"
         pool.sort(key=lambda it: (it["price"], it["id"]), reverse=reverse)
-        start = (page - 1) * limit
-        return pool[start:start + limit]
 
-    sort_code = SORTS.get(sort, 1)
-    items = _fetch_one_search_page(query, sort_code, page, via=via, min_price=min_price, max_price=max_price)
-    items = _apply_price_bounds(items, min_price, max_price)
-    return items[:limit]
+    start = (page - 1) * limit
+    return pool[start:start + limit]
 
 
 # -------------------------------------------------------- Product Detail

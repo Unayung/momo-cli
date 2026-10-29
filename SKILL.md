@@ -20,6 +20,11 @@ Read (no login):
   `/TP/...` marketplace ads with decoy NT$1-11 prices, confirmed on the live site itself — the
   CLI drops those and sorts real listings itself, so results may rank only among
   relevance-discovered items rather than momo's full catalog.
+- All sorts (including default `relevance`) dedupe by product id across the backend pages
+  fetched per request: momo's pinned block can repeat a second time later in the *same* page,
+  and leaks across pages (page 2 can replay a page-1 item). Fetches accumulate backend pages
+  until `--limit` unique ids are collected, so a page is always unique and never repeats the
+  previous page.
 
 Login (never ask for or type passwords/OTP):
 - `momo login` copies the session from Edge on CDP 9222 (`MOMO_CDP`). If Edge is not signed in,

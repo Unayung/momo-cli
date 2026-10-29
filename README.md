@@ -27,6 +27,15 @@ than momo's whole catalog (which momo's own sort can't reliably do either
 for this kind of query). `relevance|sales|newest` still use momo's own
 server-side order directly, with the same ad-listing exclusion applied.
 
+All sorts, including the default `relevance`, dedupe by product id across
+the backend pages fetched for a request: momo's pinned/sponsored block can
+repeat a second time later within the *same* page's own listing, and leaks
+across pages (a page-2 request can replay a page-1 pinned item). The CLI
+fetches backend pages sequentially, keeps the first occurrence of each id,
+and backfills with more backend pages until `--limit` is satisfied, so
+results are guaranteed unique within a page and never repeat across
+consecutive pages.
+
 ## Login (no password)
 
 momo uses password + CAPTCHA / OTP, so the CLI never handles credentials.
