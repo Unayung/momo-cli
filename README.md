@@ -15,6 +15,18 @@ momo price <url|id> [<url|id> ...]           # batch price/stock check (monitori
 momo raw 'api/shoppingcart/query/getEachCartPICount'   # read-only GET passthrough
 ```
 
+`--sort price` / `price-desc` are sorted client-side from clean, ad-free results:
+momo's own server-side price sort was found to inject a pinned sponsor block
+(same ~6 items up front regardless of sort) and `/TP/...` marketplace
+listings with decoy NT$1-11 teaser prices (confirmed on the live site, not
+just the scrape), so the CLI instead gathers candidates from relevance pages
+(measured ad-free), drops any listing without a real product id, dedupes,
+and sorts/paginates itself — giving a provably sorted, bogus-price-free
+result at the cost of ranking only among relevance-discovered items rather
+than momo's whole catalog (which momo's own sort can't reliably do either
+for this kind of query). `relevance|sales|newest` still use momo's own
+server-side order directly, with the same ad-listing exclusion applied.
+
 ## Login (no password)
 
 momo uses password + CAPTCHA / OTP, so the CLI never handles credentials.

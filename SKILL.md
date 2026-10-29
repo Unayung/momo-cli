@@ -15,6 +15,11 @@ Read (no login):
   shipping, rating, reviews, `specs[]` with variant id / name / price / stock, url
 - `momo price <id> <id> … [--json]` → batch price/stock check for price monitoring
 - Product IDs are digit strings (e.g. `7252730`); full URLs (`GoodsDetail.jsp?i_code=...`) work too.
+- `--sort price`/`price-desc` are sorted client-side from relevance-pool results: momo's own
+  price sort mixes in a pinned sponsor block (same items up front regardless of sort) and
+  `/TP/...` marketplace ads with decoy NT$1-11 prices, confirmed on the live site itself — the
+  CLI drops those and sorts real listings itself, so results may rank only among
+  relevance-discovered items rather than momo's full catalog.
 
 Login (never ask for or type passwords/OTP):
 - `momo login` copies the session from Edge on CDP 9222 (`MOMO_CDP`). If Edge is not signed in,
