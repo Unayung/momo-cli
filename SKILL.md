@@ -45,3 +45,5 @@ Pitfalls:
 - Cart mutators require valid `STORAGEINFO` and `VERSION` tokens from the cart page, saved by `momo login --from-browser` (a cookie login keeps the saved ones for the same account).
 - Specs: `cart add` on multi-variant products needs `--spec <id|name>`; `product` lists all available choices.
 - No checkout / payment / order placement endpoints exist in the CLI by design; never attempt order placement.
+
+CDP setup: if `momo doctor` shows `cdp` failing and a command needs Edge, ask the user to start it as in README "Browser on CDP 9222" (separate `--user-data-dir`, `--remote-debugging-port=9222`). Never launch a browser yourself.
