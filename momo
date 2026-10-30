@@ -56,12 +56,17 @@ Cart (JSON API on cart.momoshop.com.tw, requires session cookies + Authorization
        Payload: {"host":"WEB","data":{"cartName":"newNormal","productKey":...,"productStatus":"0",
        "productKeyList":[...]}}
 
-Login: never passwords/OTP. `momo login` (default --from-browser) reads the
-cookies of Edge on MOMO_CDP (default http://127.0.0.1:9222). If not signed in
-it opens momo's login page in a background tab and polls until you sign in there.
-It extracts STORAGEINFO and VERSION from the cart page and verifies the session
-with getEachCartPICount before saving to ~/.config/momo/state.json (0600) or
-keyring (--keyring). MOMO_COOKIE overrides both. Cart commands use the saved session.
+Login: never passwords/OTP. `momo login` takes a DevTools `Cookie:` request header:
+from stdin when piped, else from the clipboard (exit 2 + instructions if the
+clipboard holds no momo Cookie header). Also --from-clipboard / --cookie-stdin.
+`momo login --from-browser` (opt-in) reads the cookies of Edge on MOMO_CDP
+(default http://127.0.0.1:9222); if not signed in it opens momo's login page in a
+background tab and polls until you sign in there, and also extracts
+STORAGEINFO and VERSION (localStorage, not in the Cookie header) from the cart
+page; a cookie login keeps the ones already saved for the same account.
+The session is verified with getEachCartPICount before saving to
+~/.config/momo/state.json (0600) or keyring (--keyring). MOMO_COOKIE overrides
+both. Cart commands use the saved session.
 
 Transport: plain HTTPS first; on bot-block or captcha falls back to CDP background tab.
 --via auto|http|browser.
@@ -1256,7 +1261,12 @@ def login_from_cookie(cookie_str, keyring=False):
         "saved_at": int(time.time()),
     }
     cd = {c["name"]: c["value"] for c in cks}
-    cust_no = cd.get("cn", "")
+    try:
+        prev = load_state()
+    except Exception:
+        prev = {}
+    vres = get_cart_counts(st)  # verify over plain HTTP before saving (raises Auth if signed out)
+    cust_no = vres.get("custNo") or cd.get("cn", "")
     masked_name = urllib.parse.unquote(cd.get("loginUser", "")).strip()
     ck_mlu = cd.get("ck_mlu", "")
     member_id = ""
@@ -1265,6 +1275,11 @@ def login_from_cookie(cookie_str, keyring=False):
             member_id = base64.b64decode(ck_mlu.strip('"')).decode("utf-8", errors="replace")
         except Exception:
             member_id = ck_mlu
+
+    pu = prev.get("user") or {}
+    if member_id and pu.get("memberId") == member_id:  # same account: keep what a header lacks
+        cust_no = cust_no or pu.get("custNo", "")
+        st["storage"] = prev.get("storage") or {}  # localStorage tokens are not in a Cookie header
 
     st["user"] = {
         "custNo": cust_no,
@@ -1429,8 +1444,39 @@ def cmd_raw(args):
     return emit(ok({"status": code, "response": data}), args.json)
 
 
+LOGIN_HOWTO = ("no momo Cookie header found. In the browser: DevTools > Network > click any "
+               "request to www.momoshop.com.tw > Request Headers > copy the `Cookie:` value, "
+               "then run `momo login` again (or pipe it in)")
+
+
+def _read_clipboard():
+    cmd = ["pbpaste"] if sys.platform == "darwin" else ["wl-paste"]
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    except Exception:
+        try:
+            return subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True,
+                                  text=True, check=True).stdout
+        except Exception:
+            raise Usage("could not read clipboard (install wl-paste or xclip)")
+
+
+def _looks_like_cookie(raw):
+    c = clean_cookie(raw)
+    return "\n" not in c and "=" in c and (";" in c or len(c) > 200) and (
+        "loginUser=" in c or "cn=" in c or "ck_mlu=" in c)
+
+
 def cmd_login(args):
-    if args.cookie_stdin:
+    if not (args.cookie_stdin or args.from_clipboard or args.from_browser):
+        try:
+            raw = sys.stdin.read() if not sys.stdin.isatty() else _read_clipboard()
+        except Usage:
+            raw = ""
+        if not _looks_like_cookie(raw):
+            raise Usage(LOGIN_HOWTO)
+        st = login_from_cookie(raw, keyring=args.keyring)
+    elif args.cookie_stdin:
         cookie_str = sys.stdin.read()
         st = login_from_cookie(cookie_str, keyring=args.keyring)
     elif args.from_clipboard:
@@ -1657,10 +1703,10 @@ def build_parser():
     r.add_argument("path", help="path or full URL")
     r.set_defaults(fn=cmd_raw)
 
-    lg = sub.add_parser("login", parents=[common], help="save a signed-in momo session")
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in momo session (default: Cookie header from stdin or clipboard)")
     g = lg.add_mutually_exclusive_group()
-    g.add_argument("--from-browser", action="store_true", default=True,
-                   help="(default) copy session from Edge CDP")
+    g.add_argument("--from-browser", action="store_true",
+                   help="(opt-in) copy session from Edge CDP")
     g.add_argument("--from-clipboard", action="store_true", help="Cookie header from clipboard")
     g.add_argument("--cookie-stdin", action="store_true", help="paste/pipe Cookie header")
     lg.add_argument("--wait", type=int, default=300, help="seconds to wait for login (default: 300)")

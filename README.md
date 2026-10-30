@@ -38,19 +38,35 @@ consecutive pages.
 
 ## Login (no password)
 
-momo uses password + CAPTCHA / OTP, so the CLI never handles credentials.
+momo uses password + CAPTCHA / OTP, so the CLI never handles credentials. It logs in with the
+`Cookie` request header of a browser session you already have:
+
+1. In your browser: DevTools > Network > click any request to `www.momoshop.com.tw` > Request Headers.
+2. Copy the value of `Cookie:` (with or without the leading `Cookie: `).
+3. Run `momo login`. It reads the clipboard, or stdin when piped.
 
 ```bash
-momo login                    # = --from-browser: copy the session from Edge on CDP 9222.
-                              #   Not signed in? opens the login page in a background tab
-                              #   and waits (--wait 300) until you sign in yourself
-momo login --from-clipboard   # copy DevTools' "Cookie" request header first
-momo login --cookie-stdin     # or paste / pipe it
+momo login                    # Cookie header from stdin (piped) or the clipboard;
+                              #   nothing usable there = exit 2 with these steps
+momo login --from-clipboard   # clipboard only
+momo login --cookie-stdin     # paste or pipe it
+momo login --keyring          # store it in the OS keyring instead of the file
+momo login --from-browser     # opt-in: copy the session from Edge on CDP 9222; if not signed in,
+                              #   opens the login page in a background tab (--wait 300)
 momo whoami                   # verifies the SAVED session over plain HTTP
 momo logout
 ```
 
-The session is verified with `api/shoppingcart/query/getEachCartPICount` before saving to `~/.config/momo/state.json` (0600, moved by `MOMO_HOME`) or the OS keyring with `--keyring`. `MOMO_COOKIE` overrides both.
+The session is verified with `api/shoppingcart/query/getEachCartPICount` before saving to
+`~/.config/momo/state.json` (0600, moved by `MOMO_HOME`) or the OS keyring with `--keyring`.
+`MOMO_COOKIE` overrides both. Exit 3 means there is no valid session (or it expired): log in again.
+
+The cart write API also sends `STORAGEINFO` and `VERSION` from the browser's localStorage, which a
+Cookie header does not contain. `--from-browser` captures them; a cookie login for the same
+account keeps the ones already saved.
+
+Edge on CDP 9222 is needed only for `login --from-browser` and as the fallback when a read is
+bot-walled.
 
 ## Cart (購物車)
 

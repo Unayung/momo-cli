@@ -6,7 +6,7 @@ description: Use when searching momo購物網 (www.momoshop.com.tw) products, ch
 # momo — momo購物網 from a shell (no checkout)
 
 `~/.local/bin/momo` → `~/Projects/momo-cli/momo`. Stdlib Python 3.8+, plain HTTPS; Edge on
-CDP 9222 is a fallback and source for `momo login`. Run `momo doctor` first.
+CDP 9222 is a read fallback and the opt-in `momo login --from-browser`. Run `momo doctor` first.
 
 Read (no login):
 - `momo search <q> [--limit N] [--sort relevance|price|price-desc|sales|newest] [--min/--max TWD] [--page N] [--json]`
@@ -26,11 +26,14 @@ Read (no login):
   until `--limit` unique ids are collected, so a page is always unique and never repeats the
   previous page.
 
-Login (never ask for or type passwords/OTP):
-- `momo login` copies the session from Edge on CDP 9222 (`MOMO_CDP`). If Edge is not signed in,
-  it opens the login page in a background tab and waits up to `--wait 300`s while the USER signs in.
+Login (never ask for or type passwords/OTP, and never ask the user to paste cookies into chat):
+- Tell the user: DevTools > Network > click any www.momoshop.com.tw request > copy the `Cookie:`
+  request header to the clipboard, then run `momo login` themselves (or pipe it in on stdin).
+  No usable Cookie header = exit 2 with those steps.
 - `momo whoami` verifies the saved session over plain HTTP; exit 3 = not signed in → run `momo login`.
-- Fallbacks: `momo login --from-clipboard` / `--cookie-stdin` (DevTools Cookie header).
+- `login --from-browser` is opt-in only (Edge on CDP 9222, `MOMO_CDP`; waits up to `--wait 300`s for
+  the USER to sign in). It is also the only way to capture the cart tokens (STORAGEINFO/VERSION)
+  for a new account. `--from-clipboard` / `--cookie-stdin` also work.
 
 Cart (writes need explicit user approval):
 1. `momo cart list [--json]` — lines with line #, id, name, spec, qty, price, subtotal, total
@@ -39,6 +42,6 @@ Cart (writes need explicit user approval):
 Every write re-reads the cart and verifies the change landed; never report success from POST reply alone.
 
 Pitfalls:
-- Cart mutators require valid `STORAGEINFO` and `VERSION` tokens from the cart page, saved automatically on `momo login`.
+- Cart mutators require valid `STORAGEINFO` and `VERSION` tokens from the cart page, saved by `momo login --from-browser` (a cookie login keeps the saved ones for the same account).
 - Specs: `cart add` on multi-variant products needs `--spec <id|name>`; `product` lists all available choices.
 - No checkout / payment / order placement endpoints exist in the CLI by design; never attempt order placement.
